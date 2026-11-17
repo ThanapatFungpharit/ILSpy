@@ -668,10 +668,10 @@ namespace ICSharpCode.Decompiler.Ast {
 					}
 					#endregion
 					#region Comparison
-					case ILCode.Cnull: return new Ast.BinaryOperatorExpression(UnpackDirectionExpression(arg1), BinaryOperatorType.Equality, new NullReferenceExpression());
-					case ILCode.Cnotnull: return new Ast.BinaryOperatorExpression(UnpackDirectionExpression(arg1), BinaryOperatorType.InEquality, new NullReferenceExpression());
-					case ILCode.Ceq: return new Ast.BinaryOperatorExpression(arg1, BinaryOperatorType.Equality, arg2);
-					case ILCode.Cne: return new Ast.BinaryOperatorExpression(arg1, BinaryOperatorType.InEquality, arg2);
+					case ILCode.Cnull: return MakeNullComparison(UnpackDirectionExpression(arg1), byteCode.Arguments[0].InferredType, BinaryOperatorType.Equality);
+					case ILCode.Cnotnull: return MakeNullComparison(UnpackDirectionExpression(arg1), byteCode.Arguments[0].InferredType, BinaryOperatorType.InEquality);
+					case ILCode.Ceq: return MakeEqualityComparison(byteCode, arg1, arg2, BinaryOperatorType.Equality);
+					case ILCode.Cne: return MakeEqualityComparison(byteCode, arg1, arg2, BinaryOperatorType.InEquality);
 					case ILCode.Cgt: return new Ast.BinaryOperatorExpression(arg1, BinaryOperatorType.GreaterThan, arg2);
 					case ILCode.Cgt_Un: {
 						// can also mean Inequality, when used with object references
@@ -1561,6 +1561,54 @@ namespace ICSharpCode.Decompiler.Ast {
 			return new DirectionExpression { Expression = expr, FieldDirection = FieldDirection.Ref };
 		}
 
+		Ast.Expression MakeEqualityComparison(ILExpression byteCode, Ast.Expression arg1, Ast.Expression arg2, BinaryOperatorType op)
+		{
+			if (arg2 is NullReferenceExpression && byteCode.Arguments.Count == 2)
+				return MakeNullComparison(arg1, byteCode.Arguments[0].InferredType, op);
+			if (arg1 is NullReferenceExpression && byteCode.Arguments.Count == 2) {
+				var res = MakeNullComparison(arg2, byteCode.Arguments[1].InferredType, op);
+				// Keep the original operand order
+				var left = res.Left.Detach();
+				res.Left = res.Right.Detach();
+				res.Right = left;
+				return res;
+			}
+			return new Ast.BinaryOperatorExpression(arg1, op, arg2);
+		}
+
+		/// <summary>
+		/// Creates <c>expr == null</c> or <c>expr != null</c>. If the type has a user-defined
+		/// equality operator, <c>expr</c> is cast to <c>object</c> so that the comparison stays a
+		/// reference comparison and doesn't become ambiguous (CS0034/CS9342) or call the operator.
+		/// </summary>
+		Ast.BinaryOperatorExpression MakeNullComparison(Ast.Expression expr, TypeSig type, BinaryOperatorType op)
+		{
+			if (HasUserDefinedEqualityOperator(type))
+				expr = expr.CastTo(new PrimitiveType("object"));
+			return new Ast.BinaryOperatorExpression(expr, op, new NullReferenceExpression());
+		}
+
+		static bool HasUserDefinedEqualityOperator(TypeSig type)
+		{
+			type = type.RemovePinnedAndModifiers();
+			if (type == null || type.ElementType != ElementType.Class && type.ElementType != ElementType.GenericInst)
+				return false;
+			// string's operators behave like a reference comparison when comparing with null
+			if (type.ElementType == ElementType.Class && type.DefinitionAssembly.IsCorLib() && type.FullName == "System.String")
+				return false;
+			var td = type.ToTypeDefOrRef().ResolveTypeDef();
+			for (int depth = 0; td != null && depth < 100; depth++) {
+				if (td.IsValueType)
+					return false;
+				foreach (var m in td.Methods) {
+					if (m.IsStatic && m.IsSpecialName && (m.Name == "op_Equality" || m.Name == "op_Inequality"))
+						return true;
+				}
+				td = td.BaseType?.ResolveTypeDef();
+			}
+			return false;
+		}
+
 		Ast.Expression Convert(Ast.Expression expr, TypeSig actualType, TypeSig reqType)
 		{
 			if (actualType == null || reqType == null || TypeAnalysis.IsSameType(actualType, reqType)) {
@@ -1590,7 +1638,7 @@ namespace ICSharpCode.Decompiler.Ast {
 					if (TypeAnalysis.IsIntegerOrEnum(actualType)) {
 						return new BinaryOperatorExpression(expr, BinaryOperatorType.InEquality, AstBuilder.MakePrimitive(0, actualType.ToTypeDefOrRef(), stringBuilder));
 					} else {
-						return new BinaryOperatorExpression(expr, BinaryOperatorType.InEquality, new NullReferenceExpression());
+						return MakeNullComparison(expr, actualType, BinaryOperatorType.InEquality);
 					}
 				}
 				bool requiredIsIntegerOrEnum = TypeAnalysis.IsIntegerOrEnum(reqType);
